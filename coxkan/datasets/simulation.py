@@ -65,3 +65,27 @@ def create_dataset(log_ph: callable, baseline_hazard=0.01, ranges=[-1, 1], n_sam
     if return_cindex: return df, cindex
     
     return df
+
+if __name__ == "__main__":
+    def linear_function(x1, x2,x3,x4):
+        return x1 + np.sin(2 * np.pi * x2)
+
+    def quadratic_function(x1, x2,x3,x4):
+        return x1 ** 2 + np.sin(2 * np.pi * x2)
+
+    # Example usage
+    def log_partial_hazard(x1, x2):
+        return 0.5 * x1 + 0.3 * x2
+
+    df = create_dataset(quadratic_function, baseline_hazard=0.01, ranges=[[-1, 1], [-1, 1], [-1, 1], [-1, 1]], n_samples=10000)
+
+    # split 80:20 into test and train
+    train_size = int(0.8 * len(df))
+    train_df = df[:train_size]
+    test_df = df[train_size:]
+
+    # save to csv in the data folder
+    data_loc = '/Users/mcgoug01/Downloads/CoxKAN/CoxKAN/data/'
+    train_df.to_csv(data_loc + 'sim_reviewer_1_3_train.csv', index=False)
+    test_df.to_csv(data_loc + 'sim_reviewer_1_3_test.csv', index=False)
+    print(df.head())

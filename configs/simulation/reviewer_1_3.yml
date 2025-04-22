@@ -1,0 +1,6 @@
+baseline_hazard: 0.01
+log_partial_hazard: 'lambda x1, x2, x3, x4: x1 ** 2 + np.sin(2 * np.pi * x2)'
+n_samples: 10000
+ranges:
+- -1
+- 1

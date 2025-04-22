@@ -17,11 +17,30 @@ from tqdm import tqdm
 from pathlib import Path
 import uuid
 from torch import Tensor
+from sklearn.model_selection import train_test_split
+import json
 
-from .utils import FastCoxLoss, categorical_fun, Logger, SYMBOLIC_LIB
 
 TEMP_CKPT_DIR = Path(__file__).parent / '_ckpt'
 os.makedirs(TEMP_CKPT_DIR, exist_ok=True)
+
+ordered_functions = [
+    "0",        # The identically zero model: no variability.
+    "1",        # A constant model: the minimal assumption if nothing varies.
+    "x",        # Linear: basic direct proportionality; parameters have clear interpretation.
+    "exp",      # Exponential: models constant percentage growth or decay.
+    "log",  # Logarithm: compresses scale, ubiquitous in economics and biology.
+    "sigmoid",  # Sigmoid (logistic): a classic S–curve used in classification.
+    "gaussian",  # Gaussian: bell–shaped, symmetric; central in statistics, probability theory, and kernel methods.
+    "x^2",  # Quadratic: one bend, symmetric curvature.
+    "sqrt",  # Square root: a sublinear transformation; often used for variance stabilization.
+    "sin",  # Sine: basic periodic oscillation.
+    "1/x"  # Introduces a pole at zero
+    "tan",  # Tangent: periodic with discontinuous asymptotes (implying stronger assumptions).
+    ]
+
+from .utils import FastCoxLoss, categorical_fun, Logger, SYMBOLIC_LIB
+
 
 class CoxKAN(KAN):
     """
@@ -119,6 +138,9 @@ class CoxKAN(KAN):
             kwargs['base_fun'] = torch.nn.SiLU()
         elif kwargs.get('base_fun')=='linear':
             kwargs['base_fun'] = torch.nn.Identity()
+        self.config = dict(kwargs)
+        self.pruned = False
+        self.symbolic = False
         super(CoxKAN, self).__init__(**kwargs)
 
     def process_data(self, df_train, df_test, duration_col, event_col, covariates=None, categorical_covariates=True, normalization='minmax'):
@@ -230,12 +252,13 @@ class CoxKAN(KAN):
 
         return df_train, df_test
 
-    def train(self, df_train, df_val=None, duration_col='duration', event_col='event', covariates=None, 
+    def train(self, df_train, df_val=None, do_prune_search=True, do_symbolic_fit=True, duration_col='duration', event_col='event', covariates=None,
               opt="Adam", lr=0.01, steps=100, batch=-1, early_stopping=False, stop_on='cindex',
               log=1, lamb=0., lamb_l1=1., lamb_entropy=0., 
               lamb_coef=0., lamb_coefdiff=0., update_grid=True, grid_update_num=10, stop_grid_update_step=50, 
               small_mag_threshold=1e-16, small_reg_factor=1., metrics=None, sglr_avoid=False, save_fig=False, 
-              in_vars=None, out_vars=None, beta=3, save_fig_freq=1, img_folder='./video', device='cpu', progress_bar=True):
+              in_vars=None, out_vars=None, beta=3, save_fig_freq=1, img_folder='./video', device='cpu', progress_bar=True,
+              do_reg=True,prune_split = 0.25,prune_max_threshold=0.05, prune_bins=21, verbose=False):
         """
         Train the model.
 
@@ -305,22 +328,28 @@ class CoxKAN(KAN):
                 log['val_cindex'], 1D array of val concordance index
                 log['reg'], 1D array of regularization (regularization in the total loss)
         """
+
+        if do_prune_search:
+            train,prune_opt = train_test_split(df_train, test_size=prune_split, random_state=42)
+        else:
+            train = df_train
+            prune_opt = None
         
         # spline grid update frequency
         grid_update_freq = int(stop_grid_update_step / grid_update_num)
 
         ### Register metadata
         if covariates is None: # if covariates are not provided, use all columns except duration_col and event_col
-            covariates = df_train.columns.drop([duration_col, event_col])
+            covariates = train.columns.drop([duration_col, event_col])
 
         self.duration_col, self.event_col, self.covariates = duration_col, event_col, covariates
 
         ### Prepare data
-        X_train = torch.tensor(df_train[covariates].values, dtype=torch.float32)
-        y_train = torch.tensor(df_train[[duration_col, event_col]].values, dtype=torch.float32)
-        if df_val is not None:
-            X_val = torch.tensor(df_val[covariates].values, dtype=torch.float32)
-            y_val = torch.tensor(df_val[[duration_col, event_col]].values, dtype=torch.float32)
+        X_train = torch.tensor(train[covariates].values, dtype=torch.float32)
+        y_train = torch.tensor(train[[duration_col, event_col]].values, dtype=torch.float32)
+        if prune_opt is not None:
+            X_val = torch.tensor(prune_opt[covariates].values, dtype=torch.float32)
+            y_val = torch.tensor(prune_opt[[duration_col, event_col]].values, dtype=torch.float32)
 
         ### Define regularization
         def reg(acts_scale):
@@ -332,7 +361,7 @@ class CoxKAN(KAN):
             for i in range(len(acts_scale)):
                 vec = acts_scale[i].reshape(-1, )
 
-                p = vec / torch.sum(vec)
+                p = vec / torch.sum(vec+1e-7)
                 l1 = torch.sum(nonlinear(vec))
                 entropy = - torch.sum(p * torch.log2(p + 1e-4))
                 reg_ += lamb_l1 * l1 + lamb_entropy * entropy  # both l1 and entropy
@@ -347,7 +376,7 @@ class CoxKAN(KAN):
         
         ### Define optimizer
         if opt == "Adam":
-            optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+            optimizer = torch.optim.Adam(self.parameters(), lr=lr, weight_decay=0)
         elif opt == "LBFGS":
             optimizer = LBFGS(self.parameters(), lr=lr, history_size=10, line_search_fn="strong_wolfe", tolerance_grad=1e-32, tolerance_change=1e-32, tolerance_ys=1e-32)
 
@@ -366,7 +395,7 @@ class CoxKAN(KAN):
 
         ### Define closure (inner function for optimizer.step)
         global train_loss, reg_
-        def closure():
+        def closure(do_reg=do_reg):
             global train_loss, reg_
             optimizer.zero_grad()
             pred = self.forward(X_train[train_id].to(device))
@@ -375,8 +404,11 @@ class CoxKAN(KAN):
                 train_loss = FastCoxLoss(pred[id_], y_train[train_id][id_].to(device))
             else:
                 train_loss = FastCoxLoss(pred, y_train[train_id].to(device))
-            reg_ = reg(self.acts_scale)
-            loss = train_loss + lamb * reg_
+            if do_reg:
+                reg_ = reg(self.acts_scale)
+                loss = train_loss + lamb * reg_
+            else:
+                loss = train_loss
             loss.backward()
             return loss
         
@@ -409,24 +441,24 @@ class CoxKAN(KAN):
                     log[metrics[i].__name__].append(metrics[i]().item())
 
             logger['train_loss'].append(torch.sqrt(train_loss).cpu().detach().numpy())
-            logger['train_cindex'].append(self.cindex(df_train))
-            logger['reg'].append(reg_.cpu().detach().numpy())
-            if df_val is not None:
-                val_loss = FastCoxLoss(self.forward(X_val.to(device)), y_val.to(device))
-                val_loss = torch.sqrt(val_loss).cpu().detach().numpy()
-                cindex_val = self.cindex(df_val)
-                if early_stopping and step > 1:
-                    if stop_on == 'cindex' and cindex_val > best_cindex:
-                        best_cindex = cindex_val
-                        self.save_ckpt(TEMP_CKPT_DIR / f'{best_model_hash}.pt', verbose=False)
-                    elif stop_on == 'loss' and val_loss < best_val_loss:
-                        best_val_loss = val_loss
-                        self.save_ckpt(TEMP_CKPT_DIR / f'{best_model_hash}.pt', verbose=False)
-                logger['val_loss'].append(val_loss)
-                logger['val_cindex'].append(cindex_val)
+            logger['train_cindex'].append(self.cindex(train))
+            if do_reg: logger['reg'].append(reg_.cpu().detach().numpy())
+
+            val_loss = FastCoxLoss(self.forward(X_val.to(device)), y_val.to(device))
+            val_loss = torch.sqrt(val_loss).cpu().detach().numpy()
+            cindex_val = self.cindex(prune_opt)
+            if early_stopping and step > 1:
+                if stop_on == 'cindex' and cindex_val > best_cindex:
+                    best_cindex = cindex_val
+                    self.save_ckpt(TEMP_CKPT_DIR / f'{best_model_hash}.pt', verbose=False)
+                elif stop_on == 'loss' and val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    self.save_ckpt(TEMP_CKPT_DIR / f'{best_model_hash}.pt', verbose=False)
+            logger['val_loss'].append(val_loss)
+            logger['val_cindex'].append(cindex_val)
 
             if _ % log == 0:
-                if df_val is not None: pbar_desc = f"train loss: {logger['train_loss'][-1]:.2e} | val loss: {logger['val_loss'][-1]:.2e}"
+                if prune_opt is not None: pbar_desc = f"train loss: {logger['train_loss'][-1]:.2e} | val loss: {logger['val_loss'][-1]:.2e}"
                 else: pbar_desc = f"train loss: {logger['train_loss'][-1]:.2e}"
                 if progress_bar: pbar.set_description(pbar_desc)
 
@@ -441,7 +473,23 @@ class CoxKAN(KAN):
             self.load_ckpt(TEMP_CKPT_DIR / f'{best_model_hash}.pt', verbose=False)
             print('Best model loaded (early stopping).')
             os.remove(TEMP_CKPT_DIR / f'{best_model_hash}.pt')
-            _ = self.predict(df_val) # necessary forward pass 
+            _ = self.predict(prune_opt) # necessary forward pass
+
+        print(f'Training finished. Final Training C-index: {self.cindex(train):.3f}')
+        if prune_opt is not None: print(f'Pre-pruned Validation C-index: {self.cindex(df_val):.3f}')
+        else: print('No validation set provided; cannot compute C-index.')
+
+        if do_prune_search:
+            self.prune_edges(prune_opt, threshold_method='auto', verbose=verbose, max_search=prune_max_threshold, bins=prune_bins)
+            print(f'Pruned Validation C-index: {self.cindex(df_val):.3f}')
+            self.pruned = True
+
+        if do_symbolic_fit:
+            self.auto_symbolic(verbose=verbose)
+            print(f'Symbolic Validation C-index: {self.cindex(df_val):.3f}')
+            self.symbolic = True
+
+        self.adjust_biases()
 
         return logger
 
@@ -509,8 +557,45 @@ class CoxKAN(KAN):
                 partial hazard
         """
         return np.exp(self.predict(df))
+
+    def find_prune_threshold(self, val_df, max=0.05, bins=21,cache_loc=os.getcwd(),
+                             cache_store_name='__modelcache__.pt',verbose=True):
+
+        cache_fp = cache_loc + '/' + cache_store_name
+        self.save_ckpt(cache_fp, verbose=False)
+        pruning_thresholds = np.linspace(0, max, bins)
+        cindices = np.zeros(len(pruning_thresholds))
+
+        for i, threshold in enumerate(pruning_thresholds):
+            ckan_ = CoxKAN(**self.config)
+            ckan_.load_ckpt(cache_fp, verbose=False)
+            _ = ckan_.predict(val_df)  # important forward pass after loading a model
+
+            prunable = True
+            for l in range(ckan_.depth):
+                if not (ckan_.acts_scale[l] > threshold).any():
+                    prunable = False
+                    break
+
+            ckan_ = ckan_.prune_nodes(threshold)
+            if 0 in ckan_.width: prunable = False
+            if not prunable:break
+
+            _ = ckan_.predict(val_df)  # important forward pass
+            ckan_.prune_edges(val_df, threshold_method='set',threshold=threshold,verbose=False)
+
+            cindices[i] = ckan_.cindex(val_df)
+            if verbose: print(f'Pruning threshold: {threshold:.4f}, C-Index (Val): {cindices[i]:.4f}')
+        max_cindex = np.max(cindices)
+        best_threshold = np.max(pruning_thresholds[cindices == max_cindex])
+        if np.max(cindices) < 0.51: best_threshold = 0
+        #delete model cache
+        os.remove(cache_fp)
+
+        return best_threshold
+
     
-    def prune_edges(self, threshold=0.02, verbose=True):
+    def prune_edges(self, df, threshold_method ='auto',threshold=0.02,max_search=0.05,bins=21, verbose=True):
         """
         Prune edges (activation functions) of the model based on a threshold of the L1 norm
         of that activation.
@@ -526,6 +611,18 @@ class CoxKAN(KAN):
         --------
             None
         """
+
+        #find threshold
+        if threshold_method == 'auto':
+            threshold = self.find_prune_threshold(df,max=max_search, bins=bins, verbose=verbose)
+        elif threshold_method == 'set':
+            #do nothing
+            pass
+        else:
+            raise NotImplementedError("threshold_method can be 'auto' or 'set'.")
+
+        if verbose: print(f'Pruning threshold: {threshold:.3f}')
+
         # loop through all activations
         for l in range(self.depth):
             for i in range(self.width[l]):
@@ -585,7 +682,7 @@ class CoxKAN(KAN):
                     self.remove_node(l + 1, i)
 
         model2 = CoxKAN(width=copy.deepcopy(self.width), grid=self.grid, k=self.k, base_fun=self.base_fun, device='cpu')
-        model2.load_state_dict(self.state_dict())
+        model2.load_state_dict(self.state_dict(), strict=False)
 
         # copy other attributes
         dic = {}
@@ -600,6 +697,9 @@ class CoxKAN(KAN):
             model2.act_fun[i] = model2.act_fun[i].get_subset(active_neurons[i], active_neurons[i + 1])
             model2.width[i] = len(active_neurons[i])
             model2.symbolic_fun[i] = self.symbolic_fun[i].get_subset(active_neurons[i], active_neurons[i + 1])
+
+        #set model2 biases in final layer to 0
+        model2.biases[-1].weight.data = torch.zeros(model2.width[-1], dtype=torch.float32)
 
         return model2
     
@@ -654,7 +754,7 @@ class CoxKAN(KAN):
             r2 = self.symbolic_fun[l].fix_symbolic(i, j, fun_name, x, y, a_range=a_range, b_range=b_range, verbose=verbose)
 
             # if in output layer, fix output bias to zero
-            if l == len(self.width) - 2:
+            if l == self.depth - 1:
                 self.symbolic_fun[l].affine.data[j][i][3] = 0.
 
             return r2
@@ -732,25 +832,26 @@ class CoxKAN(KAN):
         plt.plot(inputs, outputs, marker="o")
         return fig
 
-    def suggest_symbolic(self, l, i, j, a_range=(-10, 10), b_range=(-10, 10), lib=None, topk=5, verbose=True):
-        ''' 
+    def suggest_symbolic(self, l, i, j, a_range=(-10, 10), b_range=(-10, 10), lib=None, topk=5, verbose=True,
+                         high_corr=0.9):
+        '''
         Suggest the symbolic candidates of activation function phi_(l,i,j)
-        
+
         Args:
         -----
             l : int
                 layer index
-            i : int 
+            i : int
                 input neuron index
-            j : int 
+            j : int
                 output neuron index
             lib : dic
-                library of symbolic bases. If lib = None, the global default library will be used. 
+                library of symbolic bases. If lib = None, the global default library will be used.
             topk : int
                 display the top k symbolic functions (according to r2)
             verbose : bool
                 If True, more information will be printed.
-           
+
         Returns:
         --------
             fun_name : str
@@ -759,46 +860,104 @@ class CoxKAN(KAN):
                 suggested symbolic function
             r2 : float
                 coefficient of determination of best suggestion
-            
+
         '''
+
+        # Shortcut: If the network has categorical covariates and we're at layer 0,
+        # and if the covariate is categorical while the pre-fitted function is not '0',
+        # then return immediately a categorical suggestion.
         if hasattr(self, 'categorical_covariates') and l == 0:
             if self.covariates[i] in self.categorical_covariates and self.symbolic_fun[l].funs_name[j][i] != '0':
                 return 'categorical', None, 1
-            
-        r2s = []
 
-        if lib == None:
+        # Initialize lists to store r2 scores and attempted symbolic functions.
+        r2_scores = []
+        attempted_sym_lib = []
+
+        # Choose the appropriate symbolic library.
+        if lib is None:
             symbolic_lib = SYMBOLIC_LIB
         else:
-            symbolic_lib = {}
-            for item in lib:
-                symbolic_lib[item] = SYMBOLIC_LIB[item]
+            # Use only the entries in the provided lib.
+            symbolic_lib = {key: SYMBOLIC_LIB[key] for key in lib}
 
-        lib_attempted = []
-        for (name, fn) in symbolic_lib.items():
+        # remove entries from symbolic_lib that are not in ordered_functions
+        symbolic_lib = {key: symbolic_lib[key] for key in ordered_functions if key in symbolic_lib}
+
+        if verbose:
+            print(f"Suggesting symbolic function for layer {l}, input index {i}, output index {j}")
+
+        # Try fitting each candidate symbolic function.
+        for name, fn in symbolic_lib.items():
             try:
                 r2 = self.fix_symbolic(l, i, j, name, a_range=a_range, b_range=b_range, verbose=False)
-                r2s.append(r2.item())
-                lib_attempted.append((name, fn))
-            except Exception as e:
                 if verbose:
-                    print(f'Error in fitting "{name}": {e}')
+                    print(name, r2, fn)
+                r2_scores.append(r2.item())
+                attempted_sym_lib.append((name, fn))
+            except Exception as err:
+                if verbose:
+                    print(f'Error in fitting "{name}": {err}')
 
+        # Revert any temporary changes made by fix_symbolic.
         self.unfix_symbolic(l, i, j)
 
-        sorted_ids = np.argsort(r2s)[::-1][:topk]
-        r2s = np.array(r2s)[sorted_ids][:topk]
-        topk = np.minimum(topk, len(lib_attempted))
-        if verbose == True:
-            print('function', ',', 'r2')
-            for i in range(topk):
-                print(list(lib_attempted)[sorted_ids[i]][0], ',', r2s[i])
+        # Sort the attempted functions based on their predefined order in ordered_functions.
+        sorted_indices = np.argsort([ordered_functions.index(item[0]) for item in attempted_sym_lib])
+        r2_scores = np.array(r2_scores)[sorted_indices]
 
-        best_name = list(lib_attempted)[sorted_ids[0]][0]
-        best_fn = list(lib_attempted)[sorted_ids[0]][1]
-        best_r2 = r2s[0]
+        # we can use the softmax of the r2 scores to determine the best candidate
+        if len(sorted_indices) > 0:
+            # first, normally distribute the r2 scores - account for edge cases to prevent nans and infs
+            norm_r2_scores = np.clip(r2_scores, 1e-7, 1 - 1e-7)
+            norm_r2_scores = (norm_r2_scores - np.mean(norm_r2_scores)) / (np.std(norm_r2_scores)+1e-7)
+            softmax_r2 = np.exp(norm_r2_scores) / np.sum(np.exp(norm_r2_scores)+1e-7)
+
+            # if the max of softmax is greater than 0.5, return the best candidate
+            if np.max(softmax_r2) > 0.5:
+                best_index = np.argmax(softmax_r2)
+                if verbose:
+                    print("Returning the best candidate based on softmax v1.")
+                return attempted_sym_lib[sorted_indices[best_index]][0], attempted_sym_lib[sorted_indices[best_index]][1], r2_scores[best_index]
+
+            # otherwise, check if max of softmax is greater than 0.2 higher than second max - only viable if three or more functions contending.
+            elif len(softmax_r2) > 2 and (np.max(softmax_r2) - np.partition(softmax_r2, -2)[-2]) > 0.2:
+                best_index = np.argmax(softmax_r2)
+                if verbose:
+                    print("Returning the best candidate based on softmax v2.")
+                return attempted_sym_lib[sorted_indices[best_index]][0], attempted_sym_lib[sorted_indices[best_index]][
+                    1], r2_scores[best_index]
+
+        # if no r2 exceeds high_corr, return highest r2 func
+        if max(r2_scores) < high_corr:
+            if verbose:
+                print("No symbolic function with r2 > high_corr found. Returning the best of bad candidates.")
+            best_index = np.argmax(r2_scores)
+            return attempted_sym_lib[sorted_indices[best_index]][0], attempted_sym_lib[sorted_indices[best_index]][1], r2_scores[best_index]
+
+        # Filter out candidates with r2 less than high_corr and select the simplest remaining candidates.
+        valid_mask = r2_scores >= high_corr
+        sorted_indices = sorted_indices[valid_mask]
+        r2_scores = r2_scores[valid_mask]
+        attempted_sym_lib = [attempted_sym_lib[i] for i in sorted_indices]
+
+        # Re-sort for the remaining valid candidates.
+        sorted_indices = np.argsort([ordered_functions.index(item[0]) for item in attempted_sym_lib])
+        r2_scores = np.array(r2_scores)[sorted_indices]
+
+        if verbose:
+            print("Final attempted library:", attempted_sym_lib)
+            print("Final sorted indices:", sorted_indices)
+            if len(sorted_indices) > 0:
+                print("Best candidate index:", sorted_indices[0])
+                print("Best candidate:", attempted_sym_lib[sorted_indices[0]])
+
+        best_name = attempted_sym_lib[sorted_indices[0]][0]
+        best_fn = attempted_sym_lib[sorted_indices[0]][1]
+        best_r2 = r2_scores[0]
+
         return best_name, best_fn, best_r2
-    
+
     def plot_best_suggestion(l, i, j, lib=None, a_range=(-10,10), b_range=(-10,10), verbose=1):
         """
         Plot the best symbolic suggestion for activation function phi_(l,i,j)
@@ -849,7 +1008,7 @@ class CoxKAN(KAN):
         ax.legend()
         return fig
 
-    def auto_symbolic(self, min_r2=0, a_range=(-10, 10), b_range=(-10, 10), lib=None, verbose=1):
+    def auto_symbolic(self, min_r2=0,high_corr=0.9, a_range=(-10, 10), b_range=(-10, 10), lib=None, verbose=1):
         '''
         Automatic symbolic regression: using best suggestion from suggest_symbolic to replace activations with symbolic functions.
         This method is just slightly adapted from the original KAN.auto_symbolic().
@@ -872,22 +1031,26 @@ class CoxKAN(KAN):
             bool: True if all activations are successfully replaced by symbolic functions, False otherwise
         '''
 
-        for l in range(len(self.width) - 1):
+        for l in range(self.depth):
             for i in range(self.width[l]):
                 for j in range(self.width[l + 1]):
                     if self.symbolic_fun[l].mask[j, i] > 0.:
                         if verbose:
                             print(f'skipping ({l},{i},{j}) since already symbolic')
                     else:
-                        name, fn, r2 = self.suggest_symbolic(l, i, j, a_range=a_range, b_range=b_range, lib=lib, verbose=verbose > 1)
+                        name, fn, r2 = self.suggest_symbolic(l, i, j, a_range=a_range, b_range=b_range, lib=lib, verbose=verbose,
+                                                             high_corr=high_corr)
                         if r2 >= min_r2:
                             self.fix_symbolic(l, i, j, name, verbose=verbose > 1)
                             if verbose >= 1:
                                 print(f'fixing ({l},{i},{j}) with {name}, r2={r2}')
+                                print(f'({l},{i},{j})', name, r2)
                         else:
                             print(f'No symbolic formula found for ({l},{i},{j})')
-                            return False 
-                        
+                            return False
+
+
+
         return True
 
 
@@ -954,15 +1117,18 @@ class CoxKAN(KAN):
 
         symbolic_acts.append(x)
 
-        for l in range(len(self.width) - 1):
+        self.adjust_biases()
+
+        for l in range(self.depth):
             y = []
             for j in range(self.width[l + 1]):
                 yj = 0.
                 for i in range(self.width[l]):
                     a, b, c, d = self.symbolic_fun[l].affine[j, i]
-                    if l == len(self.width) - 2: d = 0
                     sympy_fun = self.symbolic_fun[l].funs_sympy[j][i]
                     fun_name = self.symbolic_fun[l].funs_name[j][i]
+
+                    # print(sympy_fun, fun_name, a, b, c, d)
                     try:
                         if fun_name == 'categorical':
                             assert a == 1 and b == 0 and c == 1 and d == 0
@@ -971,13 +1137,12 @@ class CoxKAN(KAN):
                             yj += c * sympy_fun(a * x[i] + b) + d
                     except Exception as e:
                         print('Error: ', e)
+
                 if simplify == True:
-                    y.append(sympy.simplify(yj + self.biases[l].weight.data[0, j]))
+                    y.append(sympy.simplify(yj))
                 else:
-                    if l == len(self.width) - 2:
-                        y.append(yj)
-                    else:
-                        y.append(yj + self.biases[l].weight.data[0, j])
+                    y.append(yj)
+
 
             x = y
             symbolic_acts.append(x)
@@ -993,6 +1158,7 @@ class CoxKAN(KAN):
             output_layer = [(output_layer[i] * stds[i] + means[i]) for i in range(len(output_layer))]
             symbolic_acts[-1] = output_layer
 
+
         if floating_digit is None:
             return symbolic_acts[-1], x0
 
@@ -1006,10 +1172,6 @@ class CoxKAN(KAN):
 
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
 
-        for l in range(self.depth):
-            if 1 in self.symbolic_fun[l].mask:
-                raise NotImplementedError('Saving of pruned or symbolic models not supported yet.')
-
         state = {
             'state_dict': self.state_dict(),
         }
@@ -1022,8 +1184,9 @@ class CoxKAN(KAN):
 
     def load_ckpt(self, ckpt_path, verbose=True):
         ''' Load model from checkpoint '''
-        state = torch.load(ckpt_path)
-        self.load_state_dict(state['state_dict'])
+        if verbose: print(f'Loading model from {ckpt_path}...')
+        state = torch.load(ckpt_path,weights_only=False)
+        self.load_state_dict(state['state_dict'],strict=False)
         for k, v in state.items():
             if k != 'state_dict':
                 setattr(self, k, v)
@@ -1156,3 +1319,84 @@ class CoxKAN(KAN):
             else:
                 raise NotImplementedError('Ranking terms is currently only supported for models with up to 1 hidden layer.')
         return terms_std
+
+    def adjust_biases(self):
+        """
+        Recursively adjusts biases (translational affine biases used to fit symbolic functions)
+        in the network along every branch that forms a linear connection from the output back toward the input.
+
+        For each affine mapping at layer l (mapping neurons in layer l to layer l+1):
+          - The external bias 'd' is removed (set to zero) for every connection that
+            eventually contributes to the output.
+          - If a connection uses a linear activation (activation function is 'x'),
+            the internal bias 'b' is removed, and the input neuron (index in layer l)
+            is marked for further backpropagation.
+
+        Indexing convention:
+          - l: layer index (an affine mapping from layer l to layer l+1)
+          - j: index of the input neuron (in layer l)
+          - i: index of the output neuron (in layer l+1)
+
+        Assumptions:
+          - self.depth: the total number of affine layers.
+          - self.width: a list with the number of neurons per layer (layer 0 is input, layer self.depth is output).
+          - self.symbolic_fun[l].affine[j, i]: a torch.Tensor containing a tuple (a, b, c, d)
+                for the connection from neuron j in layer l to neuron i in layer l+1.
+          - self.symbolic_fun[l].funs_name[j][i]: a string holding the activation function name
+                for that connection (with 'x' representing a linear activation).
+        """
+        LINEAR_ACTIVATION = 'x'
+
+        with torch.no_grad():
+            def recursive_adjust(l, upstream_set):
+                """
+                Recursively adjust layer l and propagate backwards.
+
+                Args:
+                  l: the current affine layer (mapping from layer l to layer l+1).
+                  upstream_set: a set of indices (of the output side of layer l) that lie on a
+                                linear chain connecting to the final output.
+
+                For each connection (from neuron j in layer l to neuron i in layer l+1) where i is in
+                upstream_set, we set the external bias (d) to zero unconditionally. If the activation
+                for that connection is linear (funs_name equals 'x'), we also set the internal bias (b) to zero
+                and add neuron j to a new upstream set for layer (l-1).
+                """
+                # Base case: nothing to adjust if no layer remains or if no neurons are marked upstream.
+                if l < 0 or not upstream_set:
+                    return
+
+                out_dim = self.symbolic_fun[l].out_dim
+                in_dim = self.symbolic_fun[l].in_dim
+                new_upstream = set()  # will hold indices in layer l that connect linearly upward
+                for j in range(out_dim):  # iterate over input neurons of layer l
+                    if j in upstream_set:
+                        for i in range(in_dim):  # iterate over output neurons of layer l+1
+                            # Retrieve the parameters for connection from neuron j to neuron i.
+                            a, b, c, d = self.symbolic_fun[l].affine[j, i]
+                            # Remove external bias in every connection.
+                            d = 0
+
+                            if len(self.biases[l].weight.data.shape) == 1:
+                                self.biases[l].weight.data[j] = 0
+                            elif len(self.biases[l].weight.data.shape) == 2:
+                                assert self.biases[l].weight.data.shape[0] == 1
+                                self.biases[l].weight.data[0, j] = 0
+                            else:
+                                raise ValueError('Bias shape not supported: {}'.format(self.biases[l].weight.data.shape))
+
+                            # If activation function is linear, remove internal bias and mark input neuron j.
+                            if self.symbolic_fun[l].funs_name[j][i] == LINEAR_ACTIVATION:
+                                b = 0
+                                new_upstream.add(i)
+                            # Update the tensor using an in-place copy to avoid gradient issues.
+                            self.symbolic_fun[l].affine[j, i].copy_(torch.tensor([a, b, c, d], dtype=torch.double))
+
+                # Recurse: adjust the previous layer (l-1) using the new upstream set.
+                recursive_adjust(l - 1, new_upstream)
+
+            # For the final affine layer (l = self.depth-1) mapping from layer (self.depth-1) to output (layer self.depth),
+            # we start with all output neurons as the upstream set.
+            output_width = self.symbolic_fun[-1].in_dim
+            initial_upstream = set(range(output_width))
+            recursive_adjust(self.depth - 1, initial_upstream)

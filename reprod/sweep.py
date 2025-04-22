@@ -96,11 +96,12 @@ elif args.exp_name[:5] == 'TCGA-':
     duration_col, event_col = 'duration', 'event'
     covariates = [col for col in df_train.columns if col not in [duration_col, event_col]]
 
-cv_search = Sweep(model=args.model, search_config=args.search_config)
+cv_search = Sweep(model=args.model, search_config=args.search_config,
+                  do_prune_search=True,do_symbolic_fit=False)
 
 study = cv_search.run_cv(df_train, 
                         duration_col, 
-                        event_col, 
+                        event_col,
                         study_name=args.exp_name if args.storage is not None else None,
                         storage=args.storage,
                         n_trials=args.n_trials, 

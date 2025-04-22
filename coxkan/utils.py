@@ -212,9 +212,13 @@ def categorical_fun(inputs, outputs, category_map):
     """
 
     # Check that all inputs are in the category map
-    unique_inputs = [round(i.item(), 3) for i in inputs.unique()]
+    unique_inputs = [np.float32(round(i.item(), 3)) for i in inputs.unique()]
+
     for inpt in unique_inputs:
-        assert inpt in category_map.keys()
+        if not any(np.isclose(inpt, key) for key in category_map.keys()):
+            raise AssertionError(f"{inpt} not close to any keys in category_map")
+        else:
+            print(f'Found a close match for {inpt} in category_map.keys()')
 
     # Create a mapping from input to output
     mapping = {}

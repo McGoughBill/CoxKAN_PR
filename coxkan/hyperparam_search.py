@@ -21,7 +21,8 @@ from .utils import FastCoxLoss
 class Sweep:
     """ Hyperparameter search (sweep) object. """
 
-    def __init__(self, model='coxkan', search_config=None):
+    def __init__(self, model='coxkan', search_config=None,
+                 do_symbolic_fit=True, do_prune_search=True):
         """
         Args:
         -----
@@ -38,6 +39,9 @@ class Sweep:
             self.search_space = yaml.safe_load(open(path.parent / f'_configs/{model}_sweep.yml', 'r'))
         else:
             self.search_space = yaml.safe_load(open(search_config, 'r'))
+
+        self.do_symbolic_fit = do_symbolic_fit
+        self.do_prune_search = do_prune_search
 
     def run_cv(self, df, duration_col, event_col, study_name=None, storage=None, n_trials=100, 
             n_folds=3, folds=None, save_params=None, n_jobs=1, verbose=1, seed=None):
@@ -246,12 +250,8 @@ class Sweep:
             test = self.df.iloc[test_idx]
             
             model = CoxKAN(**config['init_params'])
-            if 'early_stopping' in config['train_params'] and config['train_params']['early_stopping']:
-                train, val = train_test_split(train, test_size=0.2, random_state=42, stratify=train[self.event_col])
-                model.train(train, val, duration_col=self.duration_col, event_col=self.event_col, progress_bar=False, **config['train_params'])
-            else:
-                model.train(train, duration_col=self.duration_col, event_col=self.event_col, progress_bar=False, **config['train_params'])
-            model.prune_edges(threshold=config['prune_threshold'], verbose=False)
+            model.train(train,test, do_prune_search=self.do_prune_search, do_symbolic_fit=False,
+                        duration_col=self.duration_col, event_col=self.event_col, progress_bar=False, **config['train_params'])
 
             cindex = model.cindex(test)
             cindices.append(cindex)
